@@ -100,7 +100,7 @@ class BetterToolsTests(unittest.TestCase):
                 cwd=str(ROOT),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("Toolsmith Corpus Summary", result.stdout)
+            self.assertIn("Toolsmith Multi-Harness Corpus Summary", result.stdout)
             self.assertIn("prefer `rg`", result.stdout)
             self.assertNotIn("Research Phase Guidance", result.stdout)
 
@@ -305,7 +305,7 @@ class BetterToolsTests(unittest.TestCase):
                 cwd=str(ROOT),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("web-app/front-end tasks lack browser", result.stdout)
+            self.assertIn("web-app/front-end tasks lacked browser/runtime verification", result.stdout)
             self.assertIn("Research Phase Guidance", result.stdout)
             self.assertIn("recommend`, `defer`, or `reject", result.stdout)
 
@@ -351,7 +351,33 @@ class BetterToolsTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("native_macos", result.stdout)
-            self.assertIn("web-app/front-end tasks lack browser", result.stdout)
+            self.assertIn("web-app/front-end tasks lacked browser/runtime verification", result.stdout)
+
+    def test_transcript_import_is_opt_in_redacted_and_windowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / ".claude" / "projects" / "proj"
+            project.mkdir(parents=True)
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 10 * 86400))
+            command = "curl -H 'Authorization: Bearer sk-live-abc123' https://u:pw@example.com && API_TOKEN=supersecret deploy"
+            lines = [
+                {"type": "user", "timestamp": old, "message": {"content": "ancient prompt marker"}},
+                {"type": "user", "timestamp": now, "message": {"content": "run the deploy"}},
+                {"type": "user", "timestamp": now, "message": {"content": "x" * 377 + " https://u:longpassword@example.com"}},
+                {"type": "assistant", "timestamp": now, "message": {"content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": command}},
+                ]}},
+            ]
+            (project / "s.jsonl").write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+            args = [sys.executable, str(ANALYZE), "export", "--data-dir", str(Path(tmp) / "data"), "--days", "1"]
+            off = subprocess.run(args, text=True, capture_output=True, check=False, env={**os.environ, "HOME": tmp, "TOOLSMITH_TRANSCRIPTS": "0"})
+            on = subprocess.run(args, text=True, capture_output=True, check=False, env={**os.environ, "HOME": tmp, "TOOLSMITH_TRANSCRIPTS": "1"})
+            self.assertEqual(on.returncode, 0, on.stderr)
+            self.assertNotIn("run the deploy", off.stdout)
+            self.assertIn("run the deploy", on.stdout)
+            self.assertIn("Bearer <redacted>", on.stdout)
+            for leaked in ("sk-live-abc123", "supersecret", "pw@", "longpassword", "ancient prompt marker"):
+                self.assertNotIn(leaked, on.stdout)
 
     def test_prompt_capture_redacts_secret_like_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

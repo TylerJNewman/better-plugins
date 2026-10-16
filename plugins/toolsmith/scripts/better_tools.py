@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -12,6 +13,9 @@ from typing import Any, Iterable, Optional
 PLUGIN_NAME = "toolsmith"
 HOME_FALLBACK = Path.home() / ".codex" / "plugin-data" / PLUGIN_NAME
 URL_RE = re.compile(r"https?://\S+", re.I)
+ENV_SECRET_RE = re.compile(r"\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|AUTH|COOKIE)[A-Z0-9_]*)=([^\s'\"]+)", re.I)
+BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]+=*", re.I)
+BASIC_AUTH_URL_RE = re.compile(r"\b(https?://)([^/\s:@]+):([^/\s@]+)@", re.I)
 NATIVE_MACOS_SIGNALS = {
     "macos": 2,
     "swift": 2,
@@ -47,6 +51,38 @@ WEB_APP_SIGNALS = {
     ".jsx": 2,
     "npm run dev": 3,
 }
+BACKEND_DB_SIGNALS = {
+    "postgres": 3,
+    "drizzle": 3,
+    "migration": 3,
+    "sql": 2,
+    "quanta-prod-db": 4,
+    "trigger.dev": 3,
+    "schema": 2,
+    "endpoint": 2,
+    "api route": 3,
+}
+CLI_OPS_SIGNALS = {
+    "launchctl": 4,
+    "launchd": 4,
+    "plist": 3,
+    "tailscale": 3,
+    "infisical": 3,
+    "gog": 3,
+    "railway": 3,
+    "cron": 2,
+    "skill": 2,
+}
+RESEARCH_SIGNALS = {
+    "research": 3,
+    "council": 3,
+    "basic-memory": 3,
+    "granola": 3,
+    "langfuse": 3,
+    "posthog": 3,
+    "audit": 2,
+    "scout": 2,
+}
 RESEARCH_PHASE_GUIDANCE = [
     "State the observed gap in one sentence before researching external candidates.",
     "Check installed/current local tools first, including project scripts, plugin cache, dependencies, and harmless `<tool> --help` or `--version` probes.",
@@ -76,16 +112,44 @@ def locate_data_dir(override: Optional[str] = None) -> Path:
 
 
 def parse_time(value: str) -> Optional[datetime]:
+    if not value:
+        return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
 
 
+def clean_prompt_text(text: str) -> str:
+    text = re.sub(r"<USER_REQUEST>\s*", "", text)
+    text = re.sub(r"\s*</USER_REQUEST>", "", text)
+    text = re.sub(r"<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>", "", text, flags=re.S)
+    text = re.sub(r"<EPHEMERAL_MESSAGE>.*?</EPHEMERAL_MESSAGE>", "", text, flags=re.S)
+    text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.S)
+    return redact_text(" ".join(text.split()).strip())
+
+
+def redact_text(text: str) -> str:
+    text = ENV_SECRET_RE.sub(lambda m: f"{m.group(1)}=<redacted>", text)
+    text = BEARER_RE.sub("Bearer <redacted>", text)
+    return BASIC_AUTH_URL_RE.sub(r"\1<redacted>@", text)
+
+
+def hash_input(val: Any) -> str:
+    try:
+        raw = json.dumps(val, sort_keys=True, default=str)
+    except Exception:
+        raw = str(val)
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
 def iter_jsonl(paths: Iterable[Path]) -> Iterable[dict[str, Any]]:
-    for path in paths:
+    for p in paths:
         try:
-            with path.open("r", encoding="utf-8") as handle:
+            with p.open("r", encoding="utf-8", errors="ignore") as handle:
                 for line in handle:
                     if not line.strip():
                         continue
@@ -107,6 +171,192 @@ def error_files(root: Path) -> list[Path]:
     return sorted((root / "errors").glob("*.jsonl"))
 
 
+def live_transcript_events(days: int) -> list[dict[str, Any]]:
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
+    home = Path.home()
+    events: list[dict[str, Any]] = []
+
+    claude_root = home / ".claude" / "projects"
+    if claude_root.exists():
+        for f in claude_root.glob("*/*.jsonl"):
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff_ts:
+                continue
+            proj_name = f.parent.name
+            sid = f.stem
+            iso_fallback = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            for obj in iter_jsonl([f]):
+                ts = str(obj.get("timestamp") or iso_fallback)
+                t_type = obj.get("type")
+                if t_type == "user":
+                    msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+                    content = msg.get("content", "")
+                    txt = ""
+                    if isinstance(content, str):
+                        txt = content
+                    elif isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                txt += str(item.get("text") or "") + " "
+                    txt = clean_prompt_text(txt)
+                    if txt and not txt.startswith("<task-notification>") and not txt.startswith("Toolloaded"):
+                        events.append({
+                            "kind": "user_prompt",
+                            "observed_at": ts,
+                            "harness": "claude",
+                            "ids": {"session_id": f"claude:{sid}"},
+                            "project": {"project_name": proj_name},
+                            "prompt": {"excerpt": txt[:400]},
+                        })
+                elif t_type == "assistant":
+                    msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+                    content = msg.get("content", [])
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "tool_use":
+                                t_name = str(item.get("name") or "unknown")
+                                t_in = item.get("input") if isinstance(item.get("input"), dict) else {}
+                                cmd = str(t_in.get("command") or t_in.get("cmd") or "")
+                                events.append({
+                                    "kind": "tool_call",
+                                    "observed_at": ts,
+                                    "harness": "claude",
+                                    "ids": {"session_id": f"claude:{sid}"},
+                                    "project": {"project_name": proj_name},
+                                    "tool": {
+                                        "name": t_name,
+                                        "family": "shell" if cmd else "tool",
+                                        "command": cmd,
+                                        "input_hash": hash_input(t_in),
+                                    },
+                                })
+
+    codex_root = home / ".codex" / "sessions"
+    if codex_root.exists():
+        for f in codex_root.glob("*/*/*/*.jsonl"):
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff_ts:
+                continue
+            sid = f.stem
+            iso_fallback = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            for obj in iter_jsonl([f]):
+                ts = str(obj.get("timestamp") or iso_fallback)
+                o_type = obj.get("type")
+                payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+                if o_type == "event_msg" and payload.get("type") == "user_message":
+                    txt = clean_prompt_text(str(payload.get("message") or ""))
+                    if txt:
+                        events.append({
+                            "kind": "user_prompt",
+                            "observed_at": ts,
+                            "harness": "codex",
+                            "ids": {"session_id": f"codex:{sid}"},
+                            "project": {"project_name": "codex-session"},
+                            "prompt": {"excerpt": txt[:400]},
+                        })
+                elif o_type == "response_item" and payload.get("type") in ("function_call", "custom_tool_call"):
+                    t_name = str(payload.get("name") or "unknown")
+                    raw_args = payload.get("arguments") or payload.get("input") or "{}"
+                    t_in: dict[str, Any] = {}
+                    if isinstance(raw_args, str):
+                        try:
+                            parsed = json.loads(raw_args)
+                            if isinstance(parsed, dict):
+                                t_in = parsed
+                        except Exception:
+                            t_in = {"raw": raw_args[:200]}
+                    elif isinstance(raw_args, dict):
+                        t_in = raw_args
+                    cmd = str(t_in.get("cmd") or t_in.get("command") or "")
+                    if isinstance(t_in.get("command"), list):
+                        cmd = " ".join(str(x) for x in t_in["command"])
+                    events.append({
+                        "kind": "tool_call",
+                        "observed_at": ts,
+                        "harness": "codex",
+                        "ids": {"session_id": f"codex:{sid}"},
+                        "project": {"project_name": "codex-session"},
+                        "tool": {
+                            "name": t_name,
+                            "family": "shell" if cmd else "tool",
+                            "command": cmd,
+                            "input_hash": hash_input(t_in),
+                        },
+                    })
+
+    agy_root = home / ".gemini" / "antigravity" / "brain"
+    if agy_root.exists():
+        for f in agy_root.glob("*/.system_generated/logs/transcript.jsonl"):
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff_ts:
+                continue
+            cid = f.parent.parent.parent.name
+            iso_fallback = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            for obj in iter_jsonl([f]):
+                ts = str(obj.get("created_at") or iso_fallback)
+                s_type = obj.get("type")
+                if s_type == "USER_INPUT":
+                    txt = clean_prompt_text(str(obj.get("content") or ""))
+                    if txt:
+                        events.append({
+                            "kind": "user_prompt",
+                            "observed_at": ts,
+                            "harness": "antigravity",
+                            "ids": {"session_id": f"agy:{cid}"},
+                            "project": {"project_name": "antigravity"},
+                            "prompt": {"excerpt": txt[:400]},
+                        })
+                elif s_type == "PLANNER_RESPONSE":
+                    t_calls = obj.get("tool_calls")
+                    if isinstance(t_calls, list):
+                        for tc in t_calls:
+                            if not isinstance(tc, dict):
+                                continue
+                            t_name = str(tc.get("name") or tc.get("tool_name") or "unknown")
+                            raw_args = tc.get("arguments") or tc.get("args") or {}
+                            t_in = raw_args if isinstance(raw_args, dict) else {}
+                            if isinstance(raw_args, str):
+                                try:
+                                    parsed = json.loads(raw_args)
+                                    if isinstance(parsed, dict):
+                                        t_in = parsed
+                                except Exception:
+                                    pass
+                            cmd = str(t_in.get("CommandLine") or t_in.get("command") or "")
+                            events.append({
+                                "kind": "tool_call",
+                                "observed_at": ts,
+                                "harness": "antigravity",
+                                "ids": {"session_id": f"agy:{cid}"},
+                                "project": {"project_name": str(t_in.get("Cwd") or "antigravity").split("/")[-1]},
+                                "tool": {
+                                    "name": t_name,
+                                    "family": "shell" if cmd else "tool",
+                                    "command": cmd,
+                                    "input_hash": hash_input(t_in),
+                                },
+                            })
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    kept: list[dict[str, Any]] = []
+    for event in events:
+        observed = parse_time(event["observed_at"])
+        if observed and observed < cutoff:
+            continue
+        if "tool" in event:
+            event["tool"]["command"] = redact_text(event["tool"]["command"])
+        kept.append(event)
+    return kept
+
+
 def recent_events(root: Path, days: int) -> list[dict[str, Any]]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     events = []
@@ -114,17 +364,19 @@ def recent_events(root: Path, days: int) -> list[dict[str, Any]]:
         observed = parse_time(str(event.get("observed_at") or ""))
         if not observed or observed >= cutoff:
             events.append(event)
+    if os.environ.get("TOOLSMITH_TRANSCRIPTS") == "1":
+        events.extend(live_transcript_events(days))
     return events
 
 
 def command_text(event: dict[str, Any]) -> str:
     tool = event.get("tool") if isinstance(event.get("tool"), dict) else {}
     command = tool.get("command")
-    if isinstance(command, str):
+    if isinstance(command, str) and command:
         return command
     input_value = tool.get("input")
     if isinstance(input_value, dict):
-        for key in ("command", "cmd"):
+        for key in ("command", "cmd", "CommandLine"):
             if isinstance(input_value.get(key), str):
                 return input_value[key]
     return ""
@@ -138,7 +390,6 @@ def prompt_text(event: dict[str, Any]) -> str:
     task = event.get("task") if isinstance(event.get("task"), dict) else {}
     if isinstance(task.get("prompt_excerpt"), str) and task["prompt_excerpt"]:
         return task["prompt_excerpt"]
-    # Backward compatibility with early Toolsmith prompt-link records.
     intent = event.get("intent") if isinstance(event.get("intent"), dict) else {}
     if isinstance(intent.get("prompt_excerpt"), str):
         return intent["prompt_excerpt"]
@@ -157,22 +408,28 @@ def normalize_command(command: str) -> str:
 def classify_intent_text(text: str) -> dict[str, Any]:
     lowered = text.lower()
     scores: Counter[str] = Counter()
-    signals: dict[str, list[str]] = {"native_macos": [], "web_app": [], "external_reference": []}
+    signals: dict[str, list[str]] = {
+        "native_macos": [],
+        "web_app": [],
+        "backend_db": [],
+        "cli_ops": [],
+        "research_context": [],
+        "external_reference": [],
+    }
     if URL_RE.search(text):
         signals["external_reference"].append("url_present")
-    for term, weight in NATIVE_MACOS_SIGNALS.items():
-        if term in lowered:
-            scores["native_macos"] += weight
-            signals["native_macos"].append(term)
-    for term, weight in WEB_APP_SIGNALS.items():
-        if term in lowered:
-            scores["web_app"] += weight
-            signals["web_app"].append(term)
-    domains: list[str] = []
-    if scores["native_macos"] >= 3:
-        domains.append("native_macos")
-    if scores["web_app"] >= 4:
-        domains.append("web_app")
+    for domain_name, lexicon in (
+        ("native_macos", NATIVE_MACOS_SIGNALS),
+        ("web_app", WEB_APP_SIGNALS),
+        ("backend_db", BACKEND_DB_SIGNALS),
+        ("cli_ops", CLI_OPS_SIGNALS),
+        ("research_context", RESEARCH_SIGNALS),
+    ):
+        for term, weight in lexicon.items():
+            if term in lowered:
+                scores[domain_name] += weight
+                signals[domain_name].append(term)
+    domains: list[str] = [d for d, s in scores.items() if s >= 3]
     if signals["external_reference"]:
         domains.append("external_reference")
     primary_domain = "unknown"
@@ -185,7 +442,7 @@ def classify_intent_text(text: str) -> dict[str, Any]:
         "domains": domains,
         "scores": dict(scores),
         "signals": {key: value for key, value in signals.items() if value},
-        "rules_version": "intent-lexicon-2026-05-22",
+        "rules_version": "intent-lexicon-2026-10-15",
     }
 
 
@@ -200,6 +457,8 @@ def task_key(event: dict[str, Any]) -> str:
     turn_id = ids.get("turn_id")
     if session_id and turn_id:
         return f"session-turn:{session_id}\u001f{turn_id}"
+    if session_id:
+        return f"session:{session_id}"
     return f"event:{ids.get('event_id') or event.get('observed_at') or id(event)}"
 
 
@@ -242,7 +501,7 @@ def build_task_summaries(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     task["prompt_excerpt"] = text
     output = []
     for task in tasks.values():
-        intent = classify_intent_text("\n".join(task["texts"]))
+        intent = classify_intent_text("\n".join(task["texts"][:30]))
         output.append({
             "task_key": task["task_key"],
             "prompt_excerpt": task["prompt_excerpt"],
@@ -250,6 +509,7 @@ def build_task_summaries(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "commands": task["commands"],
             "tool_records": task["tool_records"],
             "prompt_records": task["prompt_records"],
+            "texts": task["texts"],
             "intent": intent,
         })
     return output
@@ -258,6 +518,7 @@ def build_task_summaries(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     tasks = build_task_summaries(events)
     records = Counter()
+    harnesses = Counter()
     tools = Counter()
     families = Counter()
     projects = Counter()
@@ -269,6 +530,7 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     for event in events:
         kind = str(event.get("kind") or "unknown")
         records[kind] += 1
+        harnesses[str(event.get("harness") or "codex-hook")] += 1
         prompt = prompt_text(event)
         if prompt:
             prompts[prompt] += 1
@@ -292,6 +554,7 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "records": len(events),
         "record_kinds": records,
+        "harnesses": harnesses,
         "tools": tools,
         "families": families,
         "projects": projects,
@@ -332,7 +595,7 @@ def is_native_macos_task(task: dict[str, Any]) -> bool:
 
 def has_browser_runtime_proof(task: dict[str, Any]) -> bool:
     blob = f"{tool_blob(task)}\n{command_blob(task)}"
-    return any(term in blob for term in ("browser", "playwright", "puppeteer", "selenium", "cypress", "mcp__playwright"))
+    return any(term in blob for term in ("browser", "jb", "playwright", "puppeteer", "selenium", "cypress", "mcp__playwright"))
 
 
 def has_native_build(task: dict[str, Any]) -> bool:
@@ -350,21 +613,21 @@ def recommendations(summary: dict[str, Any]) -> list[str]:
     command_values = list(summary["commands"].keys())
     if command_has(command_values, "grep") and not command_has(command_values, "rg"):
         recs.append("AGENTS.md: prefer `rg` and `rg --files` over `grep`/`find` for repo search.")
+    if any("codex exec" in c and "| tail" in c for c in command_values):
+        recs.append("skill: `sol-loop` callers piped `codex exec` through `tail`, truncating multi-finding reviews; redirect to `> /tmp/sol-review.log 2>&1` instead.")
     if command_has(command_values, "jq") or any("python3 - <<" in command for command in command_values):
-        recs.append("script: repeated structured-data shell analysis is a good candidate for a small repo-local helper.")
-    if any("git status" in command for command in summary["commands"]):
-        recs.append("script: consider a repo-status helper that prints branch, dirty files, and untracked files consistently.")
+        recs.append("script: repeated structured-data shell analysis (`python3 - <<` / `jq`) is a candidate for a reusable CLI script.")
     tasks = summary.get("tasks", [])
     web_tasks = [task for task in tasks if is_web_app_task(task)]
     native_tasks = [task for task in tasks if is_native_macos_task(task)]
     if web_tasks and not any(has_browser_runtime_proof(task) for task in web_tasks):
-        recs.append("blindspot: web-app/front-end tasks lack browser/runtime verification; add a Playwright/browser smoke path before making UI claims.")
+        recs.append("skill: web-app/front-end tasks lacked browser/runtime verification (`jb` / Playwright); verify UI changes before claiming completion.")
     if native_tasks and any(has_native_build(task) for task in native_tasks) and not any(has_native_runtime_proof(task) for task in native_tasks):
-        recs.append("blindspot: native macOS/AppKit/AX work needs target-app runtime proof, not generic browser verification; pair `swift build`/`xcodebuild` with an Accessibility-focused smoke against the app under test.")
+        recs.append("skill: native macOS/AppKit/AX work needs target-app runtime proof; pair `swift build`/`xcodebuild` with an Accessibility smoke check.")
     if summary["records"] < 10:
-        recs.append("data quality: collect more events before making durable tooling decisions.")
+        recs.append("defer: collect more events before making durable tooling decisions.")
     if not recs:
-        recs.append("workflow: no obvious blindspot; convert the highest-frequency repeated pattern into the smallest script, skill, or AGENTS.md note.")
+        recs.append("defer: no high-frequency blindspot above threshold.")
     return recs
 
 
@@ -375,14 +638,17 @@ def needs_research_phase(recs: list[str]) -> bool:
     )
 
 
-def print_doctor(root: Path) -> None:
-    events = list(iter_jsonl(event_files(root)))
+def print_doctor(root: Path, days: int = 7) -> None:
+    events = recent_events(root, days)
     errors = list(iter_jsonl(error_files(root)))
     summary = summarize(events)
-    newest = max((event.get("observed_at", "") for event in events), default="none")
-    print("Toolsmith doctor")
+    newest = max((str(event.get("observed_at") or "") for event in events), default="none")
+    print("Toolsmith doctor (Multi-Harness: Claude Code + Codex + Antigravity)")
     print(f"Data root: {root}")
-    print(f"Events: {len(event_files(root))} files, {len(events)} records")
+    print(f"Window: last {days} days")
+    print(f"Events: {len(events)} records across {len(summary['tasks'])} sessions")
+    harness_summary = ", ".join(f"{name}={count}" for name, count in summary["harnesses"].most_common())
+    print(f"Harnesses: {harness_summary or 'none'}")
     print(f"Errors: {len(error_files(root))} files, {len(errors)} records")
     print(f"Newest event: {newest}")
     kind_summary = ", ".join(f"{name}={count}" for name, count in summary["record_kinds"].most_common(10))
@@ -391,29 +657,27 @@ def print_doctor(root: Path) -> None:
     print(f"Top tools: {top_tools or 'none'}")
     duplicate_total = sum(count - 1 for count in summary["input_hashes"].values() if count > 1)
     print(f"Duplicate tool-input calls: {duplicate_total}")
-    config = Path.home() / ".codex" / "config.toml"
-    if config.exists():
-        text = config.read_text(errors="ignore")
-        print(f"plugin_hooks enabled: {'plugin_hooks = true' in text}")
 
 
 def render_summary(root: Path, days: int) -> str:
     events = recent_events(root, days)
     summary = summarize(events)
     recs = recommendations(summary)
+    harness_summary = ", ".join(f"`{name}`={count}" for name, count in summary["harnesses"].most_common())
     lines = [
-        "# Toolsmith Corpus Summary",
+        "# Toolsmith Multi-Harness Corpus Summary",
         "",
         f"Data root: `{root}`",
         f"Window: last {days} days",
-        f"Records: {summary['records']}",
+        f"Harnesses: {harness_summary or 'none'}",
+        f"Records: {summary['records']} ({len(summary['tasks'])} sessions)",
         f"Tool records: {summary['record_kinds'].get('tool_call', 0)}",
         f"Prompt records: {summary['record_kinds'].get('user_prompt', 0)}",
         f"Unique tool inputs: {len(summary['input_hashes'])}",
         "",
         "## Recent User Intent",
     ]
-    for prompt, _count in summary["prompts"].most_common(5):
+    for prompt, _count in summary["prompts"].most_common(8):
         clean = " ".join(prompt.split())
         if len(clean) > 220:
             clean = clean[:217] + "..."
@@ -425,18 +689,18 @@ def render_summary(root: Path, days: int) -> str:
         "## Intent Domains",
     ])
     for domain, count in summary["intent_domains"].most_common(10):
-        lines.append(f"- `{domain}`: {count} task(s)")
+        lines.append(f"- `{domain}`: {count} session(s)")
     if not summary["intent_domains"]:
         lines.append("- No task intent domains inferred yet.")
     lines.extend([
         "",
         "## Task Slices",
     ])
-    for task in summary["tasks"][:10]:
+    for task in summary["tasks"][:12]:
         excerpt = " ".join((task.get("prompt_excerpt") or "").split())
         if len(excerpt) > 160:
             excerpt = excerpt[:157] + "..."
-        lines.append(f"- `{task['intent']['primary_domain']}` tools={task['tool_records']} prompt=`{excerpt or 'none'}`")
+        lines.append(f"- `{task['intent']['primary_domain']}` ({task['task_key'][:22]}) tools={task['tool_records']} prompt=`{excerpt or 'none'}`")
     lines.extend([
         "",
         "## Top Tools",
@@ -455,7 +719,7 @@ def render_summary(root: Path, days: int) -> str:
         if example != pattern:
             lines.append(f"  Example: `{example}`")
     lines.append("")
-    lines.append("## Recommendations")
+    lines.append("## Recommendations (5-Bucket Classification)")
     for rec in recs:
         lines.append(f"- {rec}")
     if needs_research_phase(recs):
@@ -472,14 +736,77 @@ def render_summary(root: Path, days: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_skill_audit(skill_name: str, days: int) -> str:
+    skill_paths = [
+        Path.home() / ".agents" / "skills" / skill_name / "SKILL.md",
+        Path.home() / ".claude" / "skills" / skill_name / "SKILL.md",
+        Path.home() / ".claude" / "scheduled-tasks" / skill_name / "SKILL.md",
+        Path.home() / ".gemini" / "config" / "skills" / skill_name / "SKILL.md",
+    ]
+    skill_file = next((p for p in skill_paths if p.exists()), None)
+    events = live_transcript_events(days)
+    tasks = build_task_summaries(events)
+    matching_tasks = []
+    needle = skill_name.lower()
+    for t in tasks:
+        blob = "\n".join(t["texts"]).lower()
+        if needle in blob or (needle == "sol-loop" and "codex exec" in blob):
+            matching_tasks.append(t)
+
+    lines = [
+        f"# Lamarck Per-Skill Adherence Audit: `{skill_name}`",
+        "",
+        f"- **Skill File**: `{skill_file or 'NOT FOUND'}`",
+        f"- **Window**: last {days} day(s)",
+        f"- **Matched Sessions**: {len(matching_tasks)}",
+        "",
+        "## Tool & Command Distribution in Matched Sessions",
+    ]
+    tool_counts: Counter[str] = Counter()
+    cmd_patterns: Counter[str] = Counter()
+    violations: list[str] = []
+    for t in matching_tasks:
+        tool_counts.update(t["tool_names"])
+        for c in t["commands"]:
+            first = c.splitlines()[0][:200]
+            cmd_patterns[normalize_command(first)] += 1
+            if skill_name == "sol-loop" and "codex exec" in c:
+                if "| tail" in c or "; tail" in c:
+                    violations.append(f"`{t['task_key']}` piped/truncated `codex exec` with `tail`: `{first}`")
+                if "model_reasoning_effort=max" in c:
+                    violations.append(f"`{t['task_key']}` used forbidden `model_reasoning_effort=max`: `{first}`")
+    for name, cnt in tool_counts.most_common(10):
+        lines.append(f"- `{name}`: {cnt}")
+    lines.append("")
+    lines.append("## Top Command Patterns")
+    for pat, cnt in cmd_patterns.most_common(10):
+        lines.append(f"- {cnt}x `{pat}`")
+    lines.append("")
+    lines.append("## Detected Drift / Contract Violations")
+    if skill_name != "sol-loop":
+        lines.append("- Not checked: no automated contract checks exist for this skill. Compare the samples below with its SKILL.md.")
+    elif violations:
+        for v in violations[:15]:
+            lines.append(f"- {v}")
+    else:
+        lines.append("- Zero contract violations detected across matched sessions.")
+    lines.append("")
+    lines.append("## Matched Session Samples")
+    for t in matching_tasks[:12]:
+        excerpt = " ".join((t.get("prompt_excerpt") or "").split())[:140]
+        lines.append(f"- `{t['task_key']}` (tools={t['tool_records']}): `{excerpt}`")
+    return "\n".join(lines) + "\n"
+
+
 def compact_index(root: Path, days: int) -> dict[str, Any]:
     events = recent_events(root, days)
     summary = summarize(events)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "window_days": days,
         "source_event_files": [str(path) for path in event_files(root)],
+        "harnesses": dict(summary["harnesses"]),
         "records": summary["records"],
         "tool_records": summary["record_kinds"].get("tool_call", 0),
         "prompt_records": summary["record_kinds"].get("user_prompt", 0),
@@ -540,21 +867,26 @@ def render_agents_md(root: Path, days: int) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Analyze Toolsmith JSONL corpus.")
-    parser.add_argument("command", choices=["locate", "doctor", "index", "summary", "patterns", "blindspots", "agents-md", "report", "export"])
+    parser = argparse.ArgumentParser(description="Analyze multi-harness Toolsmith & Lamarck JSONL corpus.")
+    parser.add_argument("command", choices=["locate", "doctor", "index", "summary", "patterns", "blindspots", "agents-md", "report", "export", "skill"])
+    parser.add_argument("target", nargs="?", help="Skill name when command is 'skill'")
     parser.add_argument("--data-dir")
-    parser.add_argument("--days", type=int, default=30)
+    parser.add_argument("--days", type=int, default=2)
     parser.add_argument("--out")
     args = parser.parse_args()
     root = locate_data_dir(args.data_dir)
     if args.command == "locate":
         print(root)
     elif args.command == "doctor":
-        print_doctor(root)
+        print_doctor(root, args.days)
     elif args.command == "index":
         print(write_index(root, args.days))
     elif args.command in ("summary", "patterns", "blindspots"):
         print(render_summary(root, args.days), end="")
+    elif args.command == "skill":
+        if not args.target:
+            raise SystemExit("Usage: better_tools.py skill <skill-name> [--days N]")
+        print(render_skill_audit(args.target, args.days), end="")
     elif args.command == "agents-md":
         print(render_agents_md(root, args.days), end="")
     elif args.command == "report":

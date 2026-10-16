@@ -1,6 +1,7 @@
 ---
 name: toolsmith
 description: Analyze the local Toolsmith corpus of Codex tool calls, identify tool optimization opportunities and blindspots, propose new tools or skills, and suggest focused AGENTS.md/software-engineering improvements based on observed agent behavior.
+disable-model-invocation: true
 ---
 
 # Toolsmith
